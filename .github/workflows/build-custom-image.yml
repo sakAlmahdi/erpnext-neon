@@ -1,0 +1,105 @@
+# Builds the custom ERPNext image (this repo's source) and pushes it to GHCR.
+#
+# Why the build context is frappe_docker and not this repo:
+# images/layered/Containerfile does `COPY resources/core/*.sh` from its build
+# context, so the context MUST be the frappe_docker checkout. This repo's code
+# is never copied from the context -- `bench init` clones it from Git using
+# apps.json. That is why this workflow checks out frappe_docker separately.
+#
+# Trigger manually from the Actions tab (workflow_dispatch).
+
+name: Build custom ERPNext image
+
+on:
+  workflow_dispatch:
+    inputs:
+      frappe_branch:
+        description: "Frappe framework branch (source here is v17.0.0-dev -> use develop)"
+        required: true
+        default: "develop"
+      tag:
+        description: "Image tag to push"
+        required: true
+        default: "develop"
+      app_branch:
+        description: "Branch of THIS repo to bake into the image"
+        required: true
+        default: "develop"
+
+concurrency:
+  group: build-custom-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and push to GHCR
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout frappe_docker (build context)
+        uses: actions/checkout@v4
+        with:
+          repository: frappe/frappe_docker
+          path: frappe_docker
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A private repo cannot be cloned anonymously by `bench init`, so embed a
+      # token in the URL. apps.json is passed as a BuildKit secret, so this
+      # value never lands in an image layer or in `docker image history`.
+      - name: Generate apps.json
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_BRANCH: ${{ inputs.app_branch }}
+        run: |
+          set -euo pipefail
+          printf '[{"url":"https://x-access-token:%s@github.com/%s","branch":"%s"}]\n' \
+            "$TOKEN" "${{ github.repository }}" "$APP_BRANCH" > "$GITHUB_WORKSPACE/apps.json"
+          # Print a redacted copy for debugging; never the real token.
+          sed 's/x-access-token:[^@]*@/x-access-token:***@/' "$GITHUB_WORKSPACE/apps.json"
+
+      - name: Lowercase image name
+        id: img
+        run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: frappe_docker
+          file: frappe_docker/images/layered/Containerfile
+          push: true
+          tags: ${{ steps.img.outputs.name }}:${{ inputs.tag }}
+          build-args: |
+            FRAPPE_PATH=https://github.com/frappe/frappe
+            FRAPPE_BRANCH=${{ inputs.frappe_branch }}
+            FRAPPE_IMAGE_PREFIX=frappe
+          # Absolute path: relative secret-files paths are unreliable when the
+          # build context is a subdirectory (docker/build-push-action#1326),
+          # and apps.json is generated at runtime rather than committed.
+          secret-files: |
+            apps_json=${{ github.workspace }}/apps.json
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo ""
+            echo '```'
+            echo "CUSTOM_IMAGE=${{ steps.img.outputs.name }}"
+            echo "CUSTOM_TAG=${{ inputs.tag }}"
+            echo '```'
+            echo ""
+            echo "Set these in Coolify, then redeploy."
+          } >> "$GITHUB_STEP_SUMMARY"
