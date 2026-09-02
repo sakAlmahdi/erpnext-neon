@@ -7,7 +7,7 @@
 x-customizable-image: &customizable_image
   # No fallback on purpose: a silent default would deploy stock ERPNext
   # instead of your custom build. Both vars are required.
-  image: ${CUSTOM_IMAGE:?CUSTOM_IMAGE is required}:${CUSTOM_TAG:?CUSTOM_TAG is required}
+  image: ${CUSTOM_IMAGE:-ghcr.io/sakalmahdi/erpnext-neon}:${CUSTOM_TAG:-develop}
   pull_policy: ${PULL_POLICY:-always}
   restart: ${RESTART_POLICY:-unless-stopped}
 
@@ -50,7 +50,7 @@ services:
     - --innodb-flush-log-at-trx-commit=2
     - --max-connections=150
     environment:
-      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
+      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:-}
     volumes:
     - db-data:/var/lib/mysql
     oom_score_adj: 200
@@ -113,14 +113,14 @@ services:
       SOCKETIO_PORT: 9000
       # host_name is what Frappe uses to build absolute links in emails,
       # password-reset URLs and OAuth redirects. Wrong value = broken links.
-      SITE_NAME: ${SITE_NAME:?SITE_NAME is required}
+      SITE_NAME: ${SITE_NAME:-178.18.249.38}
       # host_name builds absolute links (emails, password resets, OAuth).
       # Without a domain there is no TLS, so it must be http:// and must
       # include the published port -- otherwise every emailed link points at
       # port 80 and fails. Set SITE_SCHEME=https and SITE_HOST=<domain>
       # once the domain is attached.
       SITE_SCHEME: ${SITE_SCHEME:-http}
-      SITE_HOST: ${SITE_HOST:?SITE_HOST is required (IP:PORT now, domain later)}
+      SITE_HOST: ${SITE_HOST:-178.18.249.38:3110}
       # developer_mode=1 lets the UI write DocType changes to disk. Off by
       # default: it is slower and mutates the app source inside the container.
       DEVELOPER_MODE: ${DEVELOPER_MODE:-0}
@@ -146,12 +146,19 @@ services:
     command:
     - |
       set -e
-      SITE="${SITE_NAME:?SITE_NAME is required}"
+      # Coolify's compose parser mis-reads the fail-fast form of a variable (it
+      # takes the error message as the value), so the checks live here in shell.
+      if [ -z "${ADMIN_PASSWORD:-}" ] || [ -z "${DB_PASSWORD:-}" ]; then
+        echo "ERROR: ADMIN_PASSWORD and DB_PASSWORD must be set and non-empty." >&2
+        echo "Set both in Coolify -> Environment Variables, then redeploy." >&2
+        exit 1
+      fi
+      SITE="${SITE_NAME:-178.18.249.38}"
       if [ -d "sites/$$SITE" ]; then
         echo "Site $$SITE already exists - skipping creation."
         exit 0
       fi
-      bench new-site "$$SITE" --no-mariadb-socket --admin-password "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}" --db-root-password "${DB_PASSWORD:?DB_PASSWORD is required}" --install-app erpnext --set-default
+      bench new-site "$$SITE" --no-mariadb-socket --admin-password "${ADMIN_PASSWORD}" --db-root-password "${DB_PASSWORD}" --install-app erpnext --set-default
       echo "Site $$SITE created."
 
   # Runs `bench migrate` after the site exists. Necessary on every redeploy
@@ -174,7 +181,7 @@ services:
         echo "RUN_MIGRATIONS is not 'true' - skipping bench migrate."
         exit 0
       fi
-      bench --site "${SITE_NAME:?SITE_NAME is required}" migrate
+      bench --site "${SITE_NAME:-178.18.249.38}" migrate
       echo "Migration finished."
 
   # ---------------------------------------------------------------- app services
@@ -232,7 +239,10 @@ services:
       # attached domain equals SITE_NAME. Pinning it to SITE_NAME instead
       # makes the site resolve correctly even when reached by container
       # name, server IP, or Coolify's internal health probe.
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$SITE_NAME}
+      # Must be the site name, NOT the literal string "$$SITE_NAME": Coolify's
+      # compose parser does not expand a variable used as another variable's
+      # default, so it is spelled out here instead.
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-178.18.249.38}
       UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
       UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
       UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
