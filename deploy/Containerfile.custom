@@ -1,0 +1,100 @@
+# =============================================================================
+# Custom ERPNext image — builds this repo (sakAlmahdi/erpnext-neon) into an
+# ERPNext container.
+#
+# WHY THIS FILE EXISTS instead of using frappe_docker/images/layered:
+#   `bench` derives an app's name from its git REPO NAME and offers no way to
+#   override it (bench/app.py: app_name = basename(git_repo.working_tree_dir)).
+#   This repo is "erpnext-neon", but the Python package inside is "erpnext"
+#   (app_name in hooks.py, name in pyproject.toml). Pointing bench at the repo
+#   URL therefore makes it clone into apps/erpnext-neon and then fail looking
+#   for a package by that name — this is the `bench init` exit code 167.
+#
+#   Renaming the repo was rejected (a separate fork already owns "erpnext"),
+#   and renaming the app in-source would mean editing 925 files that import
+#   `erpnext`, plus a merge conflict on every upstream pull.
+#
+#   So: clone the repo OURSELVES into a directory named "erpnext", then let
+#   `bench get-app` read it from that path. bench takes the name from the
+#   directory, so it resolves to "erpnext" and matches the package.
+#
+# Build context MUST be a frappe_docker checkout — the final stage copies
+# resources/core/*.sh from it.
+# =============================================================================
+
+ARG FRAPPE_BRANCH=develop
+ARG FRAPPE_IMAGE_PREFIX=frappe
+
+FROM ${FRAPPE_IMAGE_PREFIX}/build:${FRAPPE_BRANCH} AS builder
+
+ARG FRAPPE_BRANCH=develop
+ARG FRAPPE_PATH=https://github.com/frappe/frappe
+ARG APP_BRANCH=develop
+ARG CACHE_BUST=""
+
+USER frappe
+
+# Plain bench init with frappe only; the app is added afterwards so we control
+# the directory name it lands in.
+RUN : "${CACHE_BUST}" && \
+  bench init \
+    --frappe-branch=${FRAPPE_BRANCH} \
+    --frappe-path=${FRAPPE_PATH} \
+    --no-procfile \
+    --no-backups \
+    --skip-redis-config-generation \
+    --verbose \
+    /home/frappe/frappe-bench
+
+WORKDIR /home/frappe/frappe-bench
+
+# app_repo_url is a BuildKit secret: it carries a token for the private repo,
+# so it must never become a build arg (those stay in `docker image history`).
+RUN --mount=type=secret,id=app_repo_url,uid=1000,gid=1000 \
+  set -eux; \
+  APP_REPO_URL="$(cat /run/secrets/app_repo_url)"; \
+  # Clone into a directory named "erpnext" so bench derives that app name.
+  git clone --depth 1 --branch "${APP_BRANCH}" "${APP_REPO_URL}" /tmp/erpnext; \
+  # get-app on a local path: bench names the app after the directory.
+  bench get-app --skip-assets /tmp/erpnext; \
+  # Sanity check: fail loudly here rather than at runtime.
+  test -d apps/erpnext || { echo "ERROR: app did not resolve to apps/erpnext"; ls -1 apps; exit 1; }; \
+  grep -q 'app_name = "erpnext"' apps/erpnext/erpnext/hooks.py; \
+  rm -rf /tmp/erpnext
+
+# Build JS/CSS for both apps. --skip-assets above deferred this so the clone
+# and the (slow) asset build stay in separate layers.
+RUN bench build --production || bench build
+
+RUN echo "{}" > sites/common_site_config.json && \
+  ls -1 apps > sites/apps.txt && \
+  find apps -mindepth 1 -path "*/.git" | xargs rm -fr
+
+# ------------------------------------------------------------------ final image
+FROM ${FRAPPE_IMAGE_PREFIX}/base:${FRAPPE_BRANCH} AS backend
+
+USER frappe
+
+COPY --from=builder --chown=frappe:frappe /home/frappe/frappe-bench /home/frappe/frappe-bench
+
+WORKDIR /home/frappe/frappe-bench
+
+# Move assets into image-layer storage; the entrypoint symlinks them back onto
+# the mounted sites volume at container start.
+RUN cp -r /home/frappe/frappe-bench/sites/assets /home/frappe/frappe-bench/assets && \
+  rm -rf /home/frappe/frappe-bench/sites/assets
+
+VOLUME [ \
+  "/home/frappe/frappe-bench/sites", \
+  "/home/frappe/frappe-bench/logs" \
+]
+
+USER root
+COPY resources/core/main-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh
+COPY resources/core/start.sh /usr/local/bin/start.sh
+RUN chmod 755 /usr/local/bin/start.sh
+
+USER frappe
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["start.sh"]

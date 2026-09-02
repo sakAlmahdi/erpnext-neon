@@ -39,6 +39,14 @@ jobs:
       packages: write
 
     steps:
+      # This repo: needed for deploy/Containerfile.custom.
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          path: self
+
+      # frappe_docker: the build context, because the final stage copies
+      # resources/core/*.sh from it.
       - name: Checkout frappe_docker (build context)
         uses: actions/checkout@v4
         with:
@@ -55,40 +63,50 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # A private repo cannot be cloned anonymously by `bench init`, so embed a
-      # token in the URL. apps.json is passed as a BuildKit secret, so this
-      # value never lands in an image layer or in `docker image history`.
-      - name: Generate apps.json
+      # Our Containerfile clones this repo itself into a directory named
+      # "erpnext" (see deploy/Containerfile.custom for why). It needs the repo
+      # URL with a token, passed as a BuildKit secret so the token never lands
+      # in an image layer or in `docker image history`.
+      - name: Write repo URL secret
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APP_BRANCH: ${{ inputs.app_branch }}
         run: |
           set -euo pipefail
-          printf '[{"url":"https://x-access-token:%s@github.com/%s","branch":"%s"}]\n' \
-            "$TOKEN" "${{ github.repository }}" "$APP_BRANCH" > "$GITHUB_WORKSPACE/apps.json"
-          # Print a redacted copy for debugging; never the real token.
-          sed 's/x-access-token:[^@]*@/x-access-token:***@/' "$GITHUB_WORKSPACE/apps.json"
+          printf 'https://x-access-token:%s@github.com/%s' \
+            "$TOKEN" "${{ github.repository }}" > "$GITHUB_WORKSPACE/app_repo_url"
+          echo "wrote app_repo_url for ${{ github.repository }}"
+
+      # The Containerfile lives in THIS repo, but the build context must be the
+      # frappe_docker checkout (the final stage copies resources/core/*.sh from
+      # it). Copy ours in so both are reachable from one context.
+      - name: Place Containerfile into build context
+        run: cp self/deploy/Containerfile.custom frappe_docker/Containerfile.custom
 
       - name: Lowercase image name
         id: img
         run: echo "name=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      # plain progress: buildx otherwise collapses the failing RUN step and
+      # the real bench error never reaches the log (that is how exit 167 hid).
       - name: Build and push
+        env:
+          BUILDKIT_PROGRESS: plain
         uses: docker/build-push-action@v6
         with:
           context: frappe_docker
-          file: frappe_docker/images/layered/Containerfile
+          file: frappe_docker/Containerfile.custom
           push: true
           tags: ${{ steps.img.outputs.name }}:${{ inputs.tag }}
           build-args: |
             FRAPPE_PATH=https://github.com/frappe/frappe
             FRAPPE_BRANCH=${{ inputs.frappe_branch }}
             FRAPPE_IMAGE_PREFIX=frappe
+            APP_BRANCH=${{ inputs.app_branch }}
           # Absolute path: relative secret-files paths are unreliable when the
           # build context is a subdirectory (docker/build-push-action#1326),
-          # and apps.json is generated at runtime rather than committed.
+          # and this file is generated at runtime rather than committed.
           secret-files: |
-            apps_json=${{ github.workspace }}/apps.json
+            app_repo_url=${{ github.workspace }}/app_repo_url
           provenance: false
 
       - name: Summary
