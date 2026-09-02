@@ -136,7 +136,7 @@ services:
   # Creates the site on first run; exits 0 afterwards if it already exists.
   create-site:
     <<: *customizable_image
-    restart: "no"
+    restart: "on-failure"
     volumes:
     - sites:/home/frappe/frappe-bench/sites
     depends_on:
@@ -165,26 +165,6 @@ services:
   # that ships new code: MIGRATE_SITES appears in frappe_docker's docs but is
   # NOT read by main-entrypoint.sh or start.sh, so migrations never run by
   # themselves. Set RUN_MIGRATIONS=false to skip.
-  migrate:
-    <<: *customizable_image
-    restart: "no"
-    volumes:
-    - sites:/home/frappe/frappe-bench/sites
-    depends_on:
-      create-site:
-        condition: service_completed_successfully
-    entrypoint: ["bash", "-c"]
-    command:
-    - |
-      set -e
-      if [ "${RUN_MIGRATIONS:-true}" != "true" ]; then
-        echo "RUN_MIGRATIONS is not 'true' - skipping bench migrate."
-        exit 0
-      fi
-      bench --site "${SITE_NAME:-erp.neon-dev.dev}" migrate
-      echo "Migration finished."
-
-  # ---------------------------------------------------------------- app services
   backend:
     <<: *backend_defaults
     environment:
@@ -194,14 +174,30 @@ services:
       GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
       GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
     depends_on:
-      migrate:
+      create-site:
         condition: service_completed_successfully
     oom_score_adj: 500
+    entrypoint:
+    - bash
+    - -c
+    command:
+    - |
+      set -e
+      # Migration runs here rather than in its own service: Coolify marks a service
+      # with restart:"no" as "excluded" and never starts it, so anything waiting on
+      # it with service_completed_successfully hangs forever.
+      if [ "${RUN_MIGRATIONS:-true}" = "true" ]; then
+        echo "Running bench migrate..."
+        bench --site "${SITE_NAME:-erp.neon-dev.dev}" migrate || {
+          echo "WARNING: migrate failed; starting anyway so logs stay reachable." >&2
+        }
+      fi
+      exec /usr/local/bin/entrypoint.sh start.sh
   websocket:
     <<: *customizable_image
     command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
     depends_on:
-      migrate:
+      create-site:
         condition: service_completed_successfully
     volumes:
     - sites:/home/frappe/frappe-bench/sites
@@ -210,21 +206,21 @@ services:
     <<: *backend_defaults
     command: bench worker --queue short,default
     depends_on:
-      migrate:
+      create-site:
         condition: service_completed_successfully
     oom_score_adj: 700
   queue-long:
     <<: *backend_defaults
     command: bench worker --queue long,default,short
     depends_on:
-      migrate:
+      create-site:
         condition: service_completed_successfully
     oom_score_adj: 700
   scheduler:
     <<: *backend_defaults
     command: bench schedule
     depends_on:
-      migrate:
+      create-site:
         condition: service_completed_successfully
     oom_score_adj: 700
   frontend:
