@@ -19,7 +19,7 @@ x-depends-on-configurator: &depends_on_configurator
 x-backend-defaults: &backend_defaults
   <<: [*depends_on_configurator, *customizable_image]
   volumes:
-    - sites:/home/frappe/frappe-bench/sites
+  - sites:/home/frappe/frappe-bench/sites
 
 services:
   # ---------------------------------------------------------------- data stores
@@ -32,49 +32,102 @@ services:
       timeout: 5s
       retries: 10
     command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-      - --skip-character-set-client-handshake
-      - --skip-innodb-read-only-compressed
+      # utf8mb4 + the handshake skip are REQUIRED by Frappe; do not remove.
+    - --character-set-server=utf8mb4
+    - --collation-server=utf8mb4_unicode_ci
+    - --skip-character-set-client-handshake
+    - --skip-innodb-read-only-compressed
+      # --- tuned for a 2 vCPU / 4 GB host ---
+      # Buffer pool ~25% of RAM leaves room for gunicorn + workers + redis.
+    # No container cap now, so MariaDB is free to grow. The buffer pool is
+    # still worth pinning: it is allocated up front and never returned to the
+    # OS, so this is the knob to raise if the DB feels slow -- and the first
+    # thing to lower if the host starts swapping.
+    - --innodb-buffer-pool-size=${DB_BUFFER_POOL:-1G}
+    - --innodb-log-file-size=256M
+      # flush_log_at_trx_commit=2 trades <1s of durability for far fewer
+      # fsyncs. Acceptable on staging; use 1 if you cannot lose a transaction.
+    - --innodb-flush-log-at-trx-commit=2
+    - --max-connections=150
     environment:
       MARIADB_ROOT_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD is required}
     volumes:
-      - db-data:/var/lib/mysql
-
+    - db-data:/var/lib/mysql
+    oom_score_adj: 200
   redis-cache:
     image: redis:7-alpine
     restart: ${RESTART_POLICY:-unless-stopped}
+    # Cache is disposable: cap it and evict the least-recently-used keys
+    # rather than letting it grow until the kernel kills something.
+    command:
+    - redis-server
+    - --maxmemory
+    - ${REDIS_CACHE_MAXMEMORY:-512mb}
+    - --maxmemory-policy
+    - allkeys-lru
+    - --save
+    - ""
     volumes:
-      - redis-cache-data:/data
-
+    - redis-cache-data:/data
+    oom_score_adj: 600
   redis-queue:
     image: redis:7-alpine
     restart: ${RESTART_POLICY:-unless-stopped}
+    # The queue is NOT disposable - jobs live here. No maxmemory eviction
+    # (dropping keys would drop jobs); persist to disk instead.
+    command:
+    - redis-server
+    - --save
+    - "60 1"
+    - --appendonly
+    - "yes"
     volumes:
-      - redis-queue-data:/data
-
-  # ---------------------------------------------------------------- one-shot init
+    - redis-queue-data:/data
+    oom_score_adj: 300
   configurator:
     <<: *backend_defaults
     deploy:
       replicas: 1
     entrypoint: ["bash", "-c"]
     command:
-      - >
-        ls -1 apps > sites/apps.txt;
-        bench set-config -g db_host $$DB_HOST;
-        bench set-config -gp db_port $$DB_PORT;
-        bench set-config -g redis_cache "redis://$$REDIS_CACHE";
-        bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
-        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
-        bench set-config -gp socketio_port $$SOCKETIO_PORT;
-        bench set-config -g chromium_path /usr/bin/chromium-headless-shell;
+    - >
+      ls -1 apps > sites/apps.txt;
+      bench set-config -g db_host $$DB_HOST;
+      bench set-config -gp db_port $$DB_PORT;
+      bench set-config -g redis_cache "redis://$$REDIS_CACHE";
+      bench set-config -g redis_queue "redis://$$REDIS_QUEUE";
+      bench set-config -g redis_socketio "redis://$$REDIS_QUEUE";
+      bench set-config -gp socketio_port $$SOCKETIO_PORT;
+      bench set-config -g chromium_path /usr/bin/chromium-headless-shell;
+      bench set-config -g maintenance_mode 0;
+      bench set-config -g pause_scheduler 0;
+      bench set-config -g developer_mode $$DEVELOPER_MODE;
+      bench set-config -g server_script_enabled $$SERVER_SCRIPT_ENABLED;
+      bench set-config -gp gunicorn_workers $$GUNICORN_WORKERS;
+      bench set-config -g host_name "$$SITE_SCHEME://$$SITE_HOST";
     environment:
       DB_HOST: db
       DB_PORT: "3306"
       REDIS_CACHE: redis-cache:6379
       REDIS_QUEUE: redis-queue:6379
       SOCKETIO_PORT: 9000
+      # host_name is what Frappe uses to build absolute links in emails,
+      # password-reset URLs and OAuth redirects. Wrong value = broken links.
+      SITE_NAME: ${SITE_NAME:?SITE_NAME is required}
+      # host_name builds absolute links (emails, password resets, OAuth).
+      # Without a domain there is no TLS, so it must be http:// and must
+      # include the published port -- otherwise every emailed link points at
+      # port 80 and fails. Set SITE_SCHEME=https and SITE_HOST=<domain>
+      # once the domain is attached.
+      SITE_SCHEME: ${SITE_SCHEME:-http}
+      SITE_HOST: ${SITE_HOST:?SITE_HOST is required (IP:PORT now, domain later)}
+      # developer_mode=1 lets the UI write DocType changes to disk. Off by
+      # default: it is slower and mutates the app source inside the container.
+      DEVELOPER_MODE: ${DEVELOPER_MODE:-0}
+      # Server Scripts execute user-authored Python. Keep disabled unless
+      # you explicitly need it - it is a remote-code-execution surface.
+      SERVER_SCRIPT_ENABLED: ${SERVER_SCRIPT_ENABLED:-0}
+      GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
     depends_on:
       db:
         condition: service_healthy
@@ -85,74 +138,123 @@ services:
     <<: *customizable_image
     restart: "no"
     volumes:
-      - sites:/home/frappe/frappe-bench/sites
+    - sites:/home/frappe/frappe-bench/sites
     depends_on:
       configurator:
         condition: service_completed_successfully
     entrypoint: ["bash", "-c"]
     command:
-      - |
-        set -e
-        SITE="${SITE_NAME:?SITE_NAME is required}"
-        if [ -d "sites/$$SITE" ]; then
-          echo "Site $$SITE already exists - skipping creation."
-          exit 0
-        fi
-        bench new-site "$$SITE" --no-mariadb-socket --admin-password "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}" --db-root-password "${DB_PASSWORD:?DB_PASSWORD is required}" --install-app erpnext --set-default
-        echo "Site $$SITE created."
+    - |
+      set -e
+      SITE="${SITE_NAME:?SITE_NAME is required}"
+      if [ -d "sites/$$SITE" ]; then
+        echo "Site $$SITE already exists - skipping creation."
+        exit 0
+      fi
+      bench new-site "$$SITE" --no-mariadb-socket --admin-password "${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}" --db-root-password "${DB_PASSWORD:?DB_PASSWORD is required}" --install-app erpnext --set-default
+      echo "Site $$SITE created."
+
+  # Runs `bench migrate` after the site exists. Necessary on every redeploy
+  # that ships new code: MIGRATE_SITES appears in frappe_docker's docs but is
+  # NOT read by main-entrypoint.sh or start.sh, so migrations never run by
+  # themselves. Set RUN_MIGRATIONS=false to skip.
+  migrate:
+    <<: *customizable_image
+    restart: "no"
+    volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    depends_on:
+      create-site:
+        condition: service_completed_successfully
+    entrypoint: ["bash", "-c"]
+    command:
+    - |
+      set -e
+      if [ "${RUN_MIGRATIONS:-true}" != "true" ]; then
+        echo "RUN_MIGRATIONS is not 'true' - skipping bench migrate."
+        exit 0
+      fi
+      bench --site "${SITE_NAME:?SITE_NAME is required}" migrate
+      echo "Migration finished."
 
   # ---------------------------------------------------------------- app services
   backend:
     <<: *backend_defaults
     environment:
+      # 2 vCPU host: (2 x 2) + 1 = 5 would starve the workers and MariaDB,
+      # so stay at 2 gthread workers x 4 threads. Raise only with more cores.
       GUNICORN_THREADS: ${GUNICORN_THREADS:-4}
       GUNICORN_WORKERS: ${GUNICORN_WORKERS:-2}
       GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-120}
     depends_on:
-      create-site:
+      migrate:
         condition: service_completed_successfully
-
+    oom_score_adj: 500
   websocket:
-    <<: [*depends_on_configurator, *customizable_image]
+    <<: *customizable_image
     command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     volumes:
-      - sites:/home/frappe/frappe-bench/sites
-
+    - sites:/home/frappe/frappe-bench/sites
+    oom_score_adj: 700
   queue-short:
     <<: *backend_defaults
     command: bench worker --queue short,default
-
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    oom_score_adj: 700
   queue-long:
     <<: *backend_defaults
     command: bench worker --queue long,default,short
-
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    oom_score_adj: 700
   scheduler:
     <<: *backend_defaults
     command: bench schedule
-
-  # ---------------------------------------------------------------- entrypoint
-  # Coolify routes its proxy to this service. Expose port 8080 in the UI
-  # and attach your domain to it.
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    oom_score_adj: 700
   frontend:
     <<: *customizable_image
     command: ["nginx-entrypoint.sh"]
     environment:
+      # Gunicorn binds 0.0.0.0:8000 inside `backend`; socketio binds 9000.
       BACKEND: backend:8000
       SOCKETIO: websocket:9000
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$$host}
+      # nginx resolves which site to serve from this value. Defaulting to
+      # $$host means "use the Host header", which works only when the
+      # attached domain equals SITE_NAME. Pinning it to SITE_NAME instead
+      # makes the site resolve correctly even when reached by container
+      # name, server IP, or Coolify's internal health probe.
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-$SITE_NAME}
       UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
       UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
       UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
       PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
       CLIENT_MAX_BODY_SIZE: ${CLIENT_MAX_BODY_SIZE:-50m}
     volumes:
-      - sites:/home/frappe/frappe-bench/sites
+    - sites:/home/frappe/frappe-bench/sites
+    # nginx inside the image has `listen 8080;` hardcoded in its template,
+    # so 8080 is fixed on the container side and cannot be remapped without
+    # rebuilding the image. Instead the HOST port is published from the
+    # 3110-3190 range, which is what makes the site reachable externally.
+    #   http://SERVER_IP:${HOST_PORT}
+    # Keep this even if you later attach a domain: Coolify's proxy talks to
+    # 8080 over the internal network, independently of this mapping.
+    ports:
+    - "${HOST_PORT:-3110}:8080"
     expose:
-      - "8080"
+    - "8080"
     depends_on:
-      - backend
-      - websocket
-
+    - backend
+    - websocket
+    oom_score_adj: 800
 volumes:
   sites:
   db-data:
