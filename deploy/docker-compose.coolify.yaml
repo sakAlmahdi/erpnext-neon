@@ -113,14 +113,14 @@ services:
       SOCKETIO_PORT: 9000
       # host_name is what Frappe uses to build absolute links in emails,
       # password-reset URLs and OAuth redirects. Wrong value = broken links.
-      SITE_NAME: ${SITE_NAME:-178.18.249.38}
+      SITE_NAME: ${SITE_NAME:-erp.neon-dev.dev}
       # host_name builds absolute links (emails, password resets, OAuth).
       # Without a domain there is no TLS, so it must be http:// and must
       # include the published port -- otherwise every emailed link points at
       # port 80 and fails. Set SITE_SCHEME=https and SITE_HOST=<domain>
       # once the domain is attached.
-      SITE_SCHEME: ${SITE_SCHEME:-http}
-      SITE_HOST: ${SITE_HOST:-178.18.249.38:3110}
+      SITE_SCHEME: ${SITE_SCHEME:-https}
+      SITE_HOST: ${SITE_HOST:-erp.neon-dev.dev}
       # developer_mode=1 lets the UI write DocType changes to disk. Off by
       # default: it is slower and mutates the app source inside the container.
       DEVELOPER_MODE: ${DEVELOPER_MODE:-0}
@@ -153,7 +153,7 @@ services:
         echo "Set both in Coolify -> Environment Variables, then redeploy." >&2
         exit 1
       fi
-      SITE="${SITE_NAME:-178.18.249.38}"
+      SITE="${SITE_NAME:-erp.neon-dev.dev}"
       if [ -d "sites/$$SITE" ]; then
         echo "Site $$SITE already exists - skipping creation."
         exit 0
@@ -181,7 +181,7 @@ services:
         echo "RUN_MIGRATIONS is not 'true' - skipping bench migrate."
         exit 0
       fi
-      bench --site "${SITE_NAME:-178.18.249.38}" migrate
+      bench --site "${SITE_NAME:-erp.neon-dev.dev}" migrate
       echo "Migration finished."
 
   # ---------------------------------------------------------------- app services
@@ -242,8 +242,11 @@ services:
       # Must be the site name, NOT the literal string "$$SITE_NAME": Coolify's
       # compose parser does not expand a variable used as another variable's
       # default, so it is spelled out here instead.
-      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-178.18.249.38}
-      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-127.0.0.1}
+      FRAPPE_SITE_NAME_HEADER: ${FRAPPE_SITE_NAME_HEADER:-erp.neon-dev.dev}
+      # Coolify's proxy reaches this container over the Docker network, not
+      # from localhost, so 127.0.0.1 would make every client appear as the
+      # proxy itself (breaking rate limits and audit logs).
+      UPSTREAM_REAL_IP_ADDRESS: ${UPSTREAM_REAL_IP_ADDRESS:-0.0.0.0}
       UPSTREAM_REAL_IP_HEADER: ${UPSTREAM_REAL_IP_HEADER:-X-Forwarded-For}
       UPSTREAM_REAL_IP_RECURSIVE: ${UPSTREAM_REAL_IP_RECURSIVE:-off}
       PROXY_READ_TIMEOUT: ${PROXY_READ_TIMEOUT:-120}
